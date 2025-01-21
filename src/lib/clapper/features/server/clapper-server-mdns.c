@@ -18,6 +18,7 @@
  */
 
 #include <gst/gst.h>
+#include <sys/socket.h>
 
 #include "clapper-server-mdns-private.h"
 
