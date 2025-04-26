@@ -909,7 +909,7 @@ _set_inhibit_session (ClapperGtkVideo *self, gboolean inhibit)
 
   root = gtk_widget_get_root (GTK_WIDGET (self));
 
-  if (!root && !GTK_IS_WINDOW (root)) {
+  if (!root || !GTK_IS_WINDOW (root)) {
     GST_WARNING_OBJECT (self, "Cannot %sinhibit session "
         "without root window", (inhibit) ? "" : "un");
     return;
@@ -919,7 +919,7 @@ _set_inhibit_session (ClapperGtkVideo *self, gboolean inhibit)
    * as it goes away early when unrooting */
   app = g_application_get_default ();
 
-  if (!app && !GTK_IS_APPLICATION (app)) {
+  if (!app || !GTK_IS_APPLICATION (app)) {
     GST_WARNING_OBJECT (self, "Cannot %sinhibit session "
         "without window application set", (inhibit) ? "" : "un");
     return;
