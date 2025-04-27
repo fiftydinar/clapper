@@ -29,6 +29,9 @@ static HMODULE _enhancers_dll_handle = NULL;
 
 #include "clapper-enhancers-loader-private.h"
 
+// Supported interfaces
+#include "clapper-extractable.h"
+
 #define ENHANCER_INTERFACES "X-Interfaces"
 #define ENHANCER_SCHEMES "X-Schemes"
 #define ENHANCER_HOSTS "X-Hosts"
@@ -38,6 +41,7 @@ static HMODULE _enhancers_dll_handle = NULL;
 GST_DEBUG_CATEGORY_STATIC (GST_CAT_DEFAULT);
 
 static PeasEngine *_engine = NULL;
+static GListStore *_proxies = NULL;
 static GMutex load_lock;
 
 static inline void
@@ -62,6 +66,7 @@ clapper_enhancers_loader_initialize (void)
 {
   const gchar *enhancers_path;
   gchar *custom_path = NULL;
+  guint i, n_items;
 
   GST_DEBUG_CATEGORY_INIT (GST_CAT_DEFAULT, "clapperenhancersloader", 0,
       "Clapper Enhancer Loader");
@@ -89,6 +94,7 @@ clapper_enhancers_loader_initialize (void)
   GST_INFO ("Initializing Clapper enhancers with path: \"%s\"", enhancers_path);
 
   _engine = peas_engine_new ();
+  _proxies = g_list_store_new (CLAPPER_TYPE_ENHANCER_PROXY);
 
   /* Peas loaders are loaded lazily, so it should be fine
    * to just enable them all here (even if not installed) */
@@ -104,21 +110,84 @@ clapper_enhancers_loader_initialize (void)
     _import_enhancers (enhancers_path);
   }
 
-  if (gst_debug_category_get_threshold (GST_CAT_DEFAULT) >= GST_LEVEL_INFO) {
-    GListModel *list = (GListModel *) _engine;
-    guint i, n_items = g_list_model_get_n_items (list);
+  n_items = g_list_model_get_n_items ((GListModel *) _engine);
+  for (i = 0; i < n_items; ++i) {
+    PeasPluginInfo *info = (PeasPluginInfo *) g_list_model_get_item ((GListModel *) _engine, i);
+    ClapperEnhancerProxy *proxy;
+    gboolean filled;
 
-    for (i = 0; i < n_items; ++i) {
-      PeasPluginInfo *info = (PeasPluginInfo *) g_list_model_get_item (list, i);
-      GST_INFO ("Found enhancer: %s (%s)", peas_plugin_info_get_name (info),
-          peas_plugin_info_get_external_data (info, ENHANCER_INTERFACES));
-      g_object_unref (info);
+    /* Support only 1 proxy per info, reasons:
+     * - Peas extension cannot have separate names and descriptions in single .plugin file
+     * - Clapper uses different object instance per interface (they cannot share config easily)
+     * - This way each cache file can store data of a whole plugin, not single extension of it */
+    proxy = clapper_enhancer_proxy_new_take ((GObject *) info);
+
+    /* Try to fill missing data from cache (fast).
+     * Otherwise make an instance and fill missing data from it (slow). */
+    if (!(filled = clapper_enhancer_proxy_fill_from_cache (proxy))) {
+      GObject *enhancer;
+      GType main_types[1] = { CLAPPER_TYPE_EXTRACTABLE };
+      guint j;
+
+      /* We cannot ask libpeas for "any" of our main interfaces, so try each one until found */
+      for (j = 0; j < G_N_ELEMENTS (main_types); ++j) {
+        if ((enhancer = clapper_enhancers_loader_create_enhancer (main_types[j], proxy))) {
+          clapper_enhancer_proxy_fill_from_instance (proxy, main_types[j], enhancer);
+          filled = TRUE; // fill from instance never fails
+
+          /* FIXME: Should additional validation be done here?
+           * Such as checking if EXTRACTABLE has schemes and/or hosts
+           * or should this be handled in GStreamer element? */
+
+          GST_FIXME_OBJECT (proxy, "Save enhancer proxy data to cache");
+          g_object_unref (enhancer);
+
+          break;
+        }
+      }
     }
 
-    GST_INFO ("Clapper enhancers initialized, found: %u", n_items);
+    if (G_LIKELY (filled)) {
+      GST_INFO ("Found enhancer: %s (%s)", clapper_enhancer_proxy_get_friendly_name (proxy),
+          clapper_enhancer_proxy_get_extra_data (proxy, ENHANCER_INTERFACES));
+      g_list_store_append (_proxies, proxy); // takes a ref
+    } else {
+      GST_WARNING ("Enhancer \"%s\" init failed, skipping it",
+          clapper_enhancer_proxy_get_friendly_name (proxy));
+    }
+
+    gst_object_unref (proxy);
   }
 
+  GST_INFO ("Clapper enhancers initialized, found: %u",
+      g_list_model_get_n_items ((GListModel *) _proxies));
+
   g_free (custom_path);
+}
+
+/*
+ * clapper_enhancers_loader_fill_player_proxies_list:
+ *
+ * Fill list within player object with unconfigured proxies.
+ */
+void
+clapper_enhancers_loader_fill_player_proxies_list (ClapperPlayer *player)
+{
+  GListModel *list = (GListModel *) _proxies;
+  guint i, n_proxies = g_list_model_get_n_items (list);
+
+  for (i = 0; i < n_proxies; ++i) {
+    ClapperEnhancerProxy *proxy, *proxy_copy;
+
+    proxy = (ClapperEnhancerProxy *) g_list_model_get_item (list, i);
+    proxy_copy = clapper_enhancer_proxy_new_from_proxy (proxy);
+
+    gst_object_set_parent (GST_OBJECT_CAST (proxy_copy), GST_OBJECT_CAST (player));
+    g_list_store_append ((GListStore *) player->enhancer_proxies, proxy_copy); // takes a ref
+
+    gst_object_unref (proxy);
+    gst_object_unref (proxy_copy);
+  }
 }
 
 static inline gboolean
@@ -148,23 +217,24 @@ _is_name_listed (const gchar *name, const gchar *list_str)
 }
 
 /*
- * clapper_enhancers_loader_get_info:
+ * clapper_enhancers_loader_get_proxy_for_scheme_and_host:
  * @iface_type: an interface #GType
  * @scheme: an URI scheme
  * @host: (nullable): an URI host
  *
  * Returns: (transfer full) (nullable): available #PeasPluginInfo or %NULL.
  */
-static PeasPluginInfo *
-clapper_enhancers_loader_get_info (GType iface_type, const gchar *scheme, const gchar *host)
+static ClapperEnhancerProxy *
+clapper_enhancers_loader_get_proxy_for_scheme_and_host (GType iface_type,
+    const gchar *scheme, const gchar *host)
 {
-  GListModel *list = (GListModel *) _engine;
-  PeasPluginInfo *found_info = NULL;
-  guint i, n_plugins = g_list_model_get_n_items (list);
+  GListModel *list = (GListModel *) _proxies;
+  ClapperEnhancerProxy *found_proxy = NULL;
+  guint i, n_proxies = g_list_model_get_n_items (list);
   const gchar *iface_name;
   gboolean is_https;
 
-  if (n_plugins == 0) {
+  if (n_proxies == 0) {
     GST_INFO ("No Clapper enhancers found");
     return NULL;
   }
@@ -189,45 +259,42 @@ clapper_enhancers_loader_get_info (GType iface_type, const gchar *scheme, const 
   if (!host && is_https)
     return NULL;
 
-  for (i = 0; i < n_plugins; ++i) {
-    PeasPluginInfo *info = (PeasPluginInfo *) g_list_model_get_item (list, i);
-    const gchar *iface_names, *schemes, *hosts;
+  for (i = 0; i < n_proxies; ++i) {
+    ClapperEnhancerProxy *proxy = (ClapperEnhancerProxy *) g_list_model_get_item (list, i);
+    const gchar *schemes, *hosts;
 
-    if (!(iface_names = peas_plugin_info_get_external_data (info, ENHANCER_INTERFACES))) {
-      GST_DEBUG ("Skipping enhancer without interfaces: %s", peas_plugin_info_get_name (info));
-      g_object_unref (info);
+    if (!clapper_enhancer_proxy_target_has_interface (proxy, iface_type)) {
+      gst_object_unref (proxy);
       continue;
     }
-    if (!_is_name_listed (iface_name, iface_names)) {
-      g_object_unref (info);
-      continue;
-    }
-    if (!(schemes = peas_plugin_info_get_external_data (info, ENHANCER_SCHEMES))) {
-      GST_DEBUG ("Skipping enhancer without schemes: %s", peas_plugin_info_get_name (info));
-      g_object_unref (info);
+    if (!(schemes = clapper_enhancer_proxy_get_extra_data (proxy, ENHANCER_SCHEMES))) {
+      GST_DEBUG ("Skipping enhancer without schemes: %s",
+          clapper_enhancer_proxy_get_friendly_name (proxy));
+      gst_object_unref (proxy);
       continue;
     }
     if (!_is_name_listed (scheme, schemes)) {
-      g_object_unref (info);
+      gst_object_unref (proxy);
       continue;
     }
     if (is_https) {
-      if (!(hosts = peas_plugin_info_get_external_data (info, ENHANCER_HOSTS))) {
-        GST_DEBUG ("Skipping enhancer without hosts: %s", peas_plugin_info_get_name (info));
-        g_object_unref (info);
+      if (!(hosts = clapper_enhancer_proxy_get_extra_data (proxy, ENHANCER_HOSTS))) {
+        GST_DEBUG ("Skipping enhancer without hosts: %s",
+            clapper_enhancer_proxy_get_friendly_name (proxy));
+        gst_object_unref (proxy);
         continue;
       }
       if (!_is_name_listed (host, hosts)) {
-        g_object_unref (info);
+        gst_object_unref (proxy);
         continue;
       }
     }
 
-    found_info = info;
+    found_proxy = proxy;
     break;
   }
 
-  return found_info;
+  return found_proxy;
 }
 
 /*
@@ -241,38 +308,25 @@ clapper_enhancers_loader_get_info (GType iface_type, const gchar *scheme, const 
 gboolean
 clapper_enhancers_loader_has_enhancers (GType iface_type)
 {
-  GListModel *list = (GListModel *) _engine;
+  GListModel *list = (GListModel *) _proxies;
   const gchar *iface_name = ENHANCER_IFACE_NAME_FROM_TYPE (iface_type);
-  guint i, n_plugins;
+  guint i, n_proxies;
 
   GST_DEBUG ("Checking for any enhancers of type: \"%s\"", iface_name);
 
-  n_plugins = g_list_model_get_n_items (list);
+  n_proxies = g_list_model_get_n_items (list);
 
-  for (i = 0; i < n_plugins; ++i) {
-    PeasPluginInfo *info = (PeasPluginInfo *) g_list_model_get_item (list, i);
-    const gchar *iface_names;
+  for (i = 0; i < n_proxies; ++i) {
+    ClapperEnhancerProxy *proxy = (ClapperEnhancerProxy *) g_list_model_get_item (list, i);
+    gboolean has_iface;
 
-    if (!(iface_names = peas_plugin_info_get_external_data (info, ENHANCER_INTERFACES))) {
-      g_object_unref (info);
-      continue;
+    has_iface = clapper_enhancer_proxy_target_has_interface (proxy, iface_type);
+    gst_object_unref (proxy);
+
+    if (has_iface) {
+      GST_DEBUG ("Found enhancer of type: \"%s\"", iface_name);
+      return TRUE;
     }
-    if (!_is_name_listed (iface_name, iface_names)) {
-      g_object_unref (info);
-      continue;
-    }
-
-    /* Additional validation */
-    if (!peas_plugin_info_get_external_data (info, ENHANCER_SCHEMES)
-        || !peas_plugin_info_get_external_data (info, ENHANCER_HOSTS)) {
-      g_object_unref (info);
-      continue;
-    }
-
-    GST_DEBUG ("Found valid enhancers of type: \"%s\"", iface_name);
-    g_object_unref (info);
-
-    return TRUE;
   }
 
   GST_DEBUG ("No available enhancers of type: \"%s\"", iface_name);
@@ -292,49 +346,41 @@ clapper_enhancers_loader_has_enhancers (GType iface_type)
 gchar **
 clapper_enhancers_loader_get_schemes (GType iface_type)
 {
-  GListModel *list = (GListModel *) _engine;
+  GListModel *list = (GListModel *) _proxies;
   GSList *found_schemes = NULL, *fs;
   const gchar *iface_name = ENHANCER_IFACE_NAME_FROM_TYPE (iface_type);
   gchar **schemes_strv;
-  guint i, n_plugins, n_schemes;
+  guint i, n_proxies, n_schemes;
 
   GST_DEBUG ("Checking supported URI schemes for \"%s\"", iface_name);
 
-  n_plugins = g_list_model_get_n_items (list);
+  n_proxies = g_list_model_get_n_items (list);
 
-  for (i = 0; i < n_plugins; ++i) {
-    PeasPluginInfo *info = (PeasPluginInfo *) g_list_model_get_item (list, i);
-    const gchar *iface_names, *schemes;
-    gchar **tmp_strv;
-    gint j;
+  for (i = 0; i < n_proxies; ++i) {
+    ClapperEnhancerProxy *proxy = (ClapperEnhancerProxy *) g_list_model_get_item (list, i);
+    const gchar *schemes;
 
-    if (!(iface_names = peas_plugin_info_get_external_data (info, ENHANCER_INTERFACES))) {
-      g_object_unref (info);
-      continue;
-    }
-    if (!_is_name_listed (iface_name, iface_names)) {
-      g_object_unref (info);
-      continue;
-    }
-    if (!(schemes = peas_plugin_info_get_external_data (info, ENHANCER_SCHEMES))) {
-      g_object_unref (info);
-      continue;
-    }
+    if (clapper_enhancer_proxy_target_has_interface (proxy, iface_type)
+        && (schemes = clapper_enhancer_proxy_get_extra_data (proxy, ENHANCER_SCHEMES))) {
+      gchar **tmp_strv;
+      gint j;
 
-    tmp_strv = g_strsplit (schemes, ";", 0);
+      tmp_strv = g_strsplit (schemes, ";", 0);
 
-    for (j = 0; tmp_strv[j]; ++j) {
-      const gchar *scheme = tmp_strv[j];
+      for (j = 0; tmp_strv[j]; ++j) {
+        const gchar *scheme = tmp_strv[j];
 
-      if (!found_schemes || !g_slist_find_custom (found_schemes,
-          scheme, (GCompareFunc) strcmp)) {
-        found_schemes = g_slist_append (found_schemes, g_strdup (scheme));
-        GST_INFO ("Found supported URI scheme: %s", scheme);
+        if (!found_schemes || !g_slist_find_custom (found_schemes,
+            scheme, (GCompareFunc) strcmp)) {
+          found_schemes = g_slist_append (found_schemes, g_strdup (scheme));
+          GST_INFO ("Found supported URI scheme: %s", scheme);
+        }
       }
+
+      g_strfreev (tmp_strv);
     }
 
-    g_strfreev (tmp_strv);
-    g_object_unref (info);
+    gst_object_unref (proxy);
   }
 
   n_schemes = g_slist_length (found_schemes);
@@ -371,18 +417,51 @@ gboolean
 clapper_enhancers_loader_check (GType iface_type,
     const gchar *scheme, const gchar *host, const gchar **name)
 {
-  PeasPluginInfo *info;
+  ClapperEnhancerProxy *proxy;
 
-  if ((info = clapper_enhancers_loader_get_info (iface_type, scheme, host))) {
+  if ((proxy = clapper_enhancers_loader_get_proxy_for_scheme_and_host (iface_type, scheme, host))) {
     if (name)
-      *name = peas_plugin_info_get_name (info);
+      *name = clapper_enhancer_proxy_get_friendly_name (proxy);
 
-    g_object_unref (info);
+    gst_object_unref (proxy);
 
     return TRUE;
   }
 
   return FALSE;
+}
+
+/*
+ * clapper_enhancers_loader_create_enhancer:
+ * @iface_type: a requested #GType
+ * @info: a #PeasPluginInfo
+ *
+ * Creates a new enhancer object using @info.
+ *
+ * Enhancer should only be created and used within single thread.
+ *
+ * Returns: (transfer full) (nullable): a new enhancer instance.
+ */
+GObject *
+clapper_enhancers_loader_create_enhancer (GType iface_type, ClapperEnhancerProxy *proxy)
+{
+  GObject *enhancer = NULL;
+  PeasPluginInfo *info = (PeasPluginInfo *) clapper_enhancer_proxy_get_peas_info (proxy);
+
+  g_mutex_lock (&load_lock);
+
+  if (!peas_plugin_info_is_loaded (info) && !peas_engine_load_plugin (_engine, info)) {
+    GST_ERROR ("Could not load enhancer: %s", peas_plugin_info_get_name (info));
+  } else if (!peas_engine_provides_extension (_engine, info, iface_type)) {
+    GST_ERROR ("No \"%s\" enhancer in plugin: %s", ENHANCER_IFACE_NAME_FROM_TYPE (iface_type),
+        peas_plugin_info_get_name (info));
+  } else {
+    enhancer = peas_engine_create_extension (_engine, info, iface_type, NULL);
+  }
+
+  g_mutex_unlock (&load_lock);
+
+  return enhancer;
 }
 
 /*
@@ -400,24 +479,13 @@ GObject *
 clapper_enhancers_loader_create_enhancer_for_uri (GType iface_type, GUri *uri)
 {
   GObject *enhancer = NULL;
-  PeasPluginInfo *info;
+  ClapperEnhancerProxy *proxy;
   const gchar *scheme = g_uri_get_scheme (uri);
   const gchar *host = g_uri_get_host (uri);
 
-  if ((info = clapper_enhancers_loader_get_info (iface_type, scheme, host))) {
-    g_mutex_lock (&load_lock);
-
-    if (!peas_plugin_info_is_loaded (info) && !peas_engine_load_plugin (_engine, info)) {
-      GST_ERROR ("Could not load enhancer: %s", peas_plugin_info_get_name (info));
-    } else if (!peas_engine_provides_extension (_engine, info, iface_type)) {
-      GST_ERROR ("No \"%s\" enhancer in plugin: %s", ENHANCER_IFACE_NAME_FROM_TYPE (iface_type),
-          peas_plugin_info_get_name (info));
-    } else {
-      enhancer = peas_engine_create_extension (_engine, info, iface_type, NULL);
-    }
-
-    g_mutex_unlock (&load_lock);
-    g_object_unref (info);
+  if ((proxy = clapper_enhancers_loader_get_proxy_for_scheme_and_host (iface_type, scheme, host))) {
+    enhancer = clapper_enhancers_loader_create_enhancer (iface_type, proxy);
+    gst_object_unref (proxy);
   }
 
   return enhancer;

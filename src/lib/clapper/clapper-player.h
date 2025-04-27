@@ -25,6 +25,7 @@
 
 #include <glib.h>
 #include <glib-object.h>
+#include <gio/gio.h>
 #include <gst/gst.h>
 
 #include <clapper/clapper-visibility.h>
@@ -56,6 +57,9 @@ ClapperStreamList * clapper_player_get_audio_streams (ClapperPlayer *player);
 
 CLAPPER_API
 ClapperStreamList * clapper_player_get_subtitle_streams (ClapperPlayer *player);
+
+CLAPPER_API
+GListModel * clapper_player_get_enhancer_proxies (ClapperPlayer *player);
 
 CLAPPER_API
 void clapper_player_set_autoplay (ClapperPlayer *player, gboolean enabled);
